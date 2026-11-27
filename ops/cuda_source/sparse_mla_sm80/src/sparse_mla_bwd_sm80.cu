@@ -92,13 +92,18 @@ __global__ __launch_bounds__(kNumThreads) void sparse_mla_bwd_kernel(
     __nv_bfloat16* sDST = sPT + kBlockT * kHStride;          // [t][h]
     int* sIdx = reinterpret_cast<int*>(sDST + kBlockT * kHStride);
 
-    const int m = blockIdx.y;
     const int h0 = blockIdx.x * kHeadBlock;
     const int tid = threadIdx.x;
     const int warp = tid / kWarpSize;
     const int lane = tid % kWarpSize;
     const int g = lane >> 2;
     const int p = lane & 3;
+
+    // Grid-stride over query tokens; see the matching comment in sparse_mla_fwd_sm80.cu.
+    // Both kernels had s_q on gridDim.y, so fixing only the forward would still abort in
+    // the backward pass once the per-rank query length passed the 65535 ceiling.
+    for (int m = blockIdx.y; m < s_q; m += gridDim.y) {
+    __syncthreads();
     const int causal_limit = q_start_index_s + m;
 
     {
@@ -268,6 +273,7 @@ __global__ __launch_bounds__(kNumThreads) void sparse_mla_bwd_kernel(
                     __float2bfloat16(dq_acc[nt][r * 2 + c]);
             }
     }
+    }  // grid-stride over query tokens
 }
 
 }  // namespace sparse_mla_sm80
@@ -329,7 +335,11 @@ std::vector<at::Tensor> sparse_prefill_bwd_sm80(const at::Tensor& q, const at::T
         attr_set = true;
     }
 
-    const dim3 grid(h_q / kHeadBlock, s_q);
+    // y is clamped to the CUDA gridDim.y ceiling of 65535 and the kernel strides over it;
+    // see sparse_mla_fwd_sm80.cu for the full rationale.  Below the ceiling this is the
+    // original launch shape.
+    const int kMaxGridY = 65535;
+    const dim3 grid(h_q / kHeadBlock, s_q < kMaxGridY ? s_q : kMaxGridY);
     sparse_mla_bwd_kernel<<<grid, kNumThreads, smem, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(qc.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(kvc.data_ptr()),

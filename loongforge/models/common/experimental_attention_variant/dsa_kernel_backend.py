@@ -78,6 +78,12 @@ BACKEND_AUTO = "auto"
 
 VALID_BACKENDS = (BACKEND_AUTO, BACKEND_SM100, BACKEND_SM80, BACKEND_TORCH_REF, BACKEND_TILELANG)
 
+# Head count lightning_indexer_sm80 is compiled for (src/common.cuh kNumHeads).
+_SM80_INDEXER_HEADS = 32
+# Per-call output size (fp32 elements) when a wider indexer is split into head groups:
+# 2^29 elements = 2 GiB, i.e. 2048 query rows at a 256k prefix.
+_SM80_INDEXER_BLOCK_ELEMS = 1 << 29
+
 _MISSING_HINT = (
     "fused DSA backend {backend!r} needs {what}. "
     "Install the matching kernel package, or fall back with "
@@ -206,7 +212,30 @@ class DSAKernelBackend:
                 except ImportError as exc:
                     raise self._missing("lightning_indexer_sm80") from exc
 
-            logits = self._get("mqa_logits", _load)(q, k, weights, cu_seqlen_ks, cu_seqlen_ke)
+            fn = self._get("mqa_logits", _load)
+            # The SM80 kernel is compiled for exactly _SM80_INDEXER_HEADS heads.  The logits
+            # are a sum over heads (sum_h w_h * relu(q_h . k)), so wider indexers
+            # (DeepSeek-V3.2: 64) are exact as a sum of per-group calls.  The [s_q, s_kv]
+            # fp32 output is the largest tensor in the layer (32 GiB at 256k), so the
+            # groups are summed block by block over query rows instead of materialising
+            # one full-size output per group.
+            h = q.size(1)
+            if h > _SM80_INDEXER_HEADS and h % _SM80_INDEXER_HEADS == 0:
+                g = _SM80_INDEXER_HEADS
+                s_q, s_kv = q.size(0), k.size(0)
+                rows = max(1, _SM80_INDEXER_BLOCK_ELEMS // max(s_kv, 1))
+                logits = torch.empty(s_q, s_kv, device=q.device, dtype=torch.float32)
+                for r0 in range(0, s_q, rows):
+                    r1 = min(r0 + rows, s_q)
+                    ks, ke = cu_seqlen_ks[r0:r1], cu_seqlen_ke[r0:r1]
+                    out = logits[r0:r1]
+                    out.copy_(fn(q[r0:r1, :g].contiguous(), k,
+                                 weights[r0:r1, :g].contiguous(), ks, ke))
+                    for h0 in range(g, h, g):
+                        out += fn(q[r0:r1, h0:h0 + g].contiguous(), k,
+                                  weights[r0:r1, h0:h0 + g].contiguous(), ks, ke)
+            else:
+                logits = fn(q, k, weights, cu_seqlen_ks, cu_seqlen_ke)
         else:
             logits = _ref_bf16_mqa_logits(q, k, weights, cu_seqlen_ks, cu_seqlen_ke)
 
@@ -251,6 +280,19 @@ class DSAKernelBackend:
                     return None
 
             fn = self._get("mqa_logits_bwd", _load)
+            h = q.size(1)
+            if fn is not None and h > _SM80_INDEXER_HEADS and h % _SM80_INDEXER_HEADS == 0:
+                # Head groups are independent: grad_q / grad_w split by head, grad_k sums.
+                g = _SM80_INDEXER_HEADS
+                d_q, d_k, d_w = [], None, []
+                for h0 in range(0, h, g):
+                    gq, gk, gw = fn(grad_logits, q[:, h0:h0 + g].contiguous(), k,
+                                    weights[:, h0:h0 + g].contiguous(), cu_seqlen_ks,
+                                    cu_seqlen_ke, topk_indices)
+                    d_q.append(gq)
+                    d_w.append(gw)
+                    d_k = gk if d_k is None else d_k + gk
+                return torch.cat(d_q, dim=1), d_k, torch.cat(d_w, dim=1)
             if fn is not None:
                 return fn(grad_logits, q, k, weights, cu_seqlen_ks, cu_seqlen_ke,
                           topk_indices)

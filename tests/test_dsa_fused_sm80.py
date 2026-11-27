@@ -195,6 +195,128 @@ def test_sparse_mla_sm80_backward_matches_reference():
     assert _rel(got_dkv, ref_dkv) < 5e-2
 
 
+@pytest.mark.parametrize(
+    "num_heads, backend, expected",
+    [(32, "sm80", 32), (40, "sm80", 48), (64, "sm80", 64), (8, "sm80", 16), (128, "sm80", 128),
+     (32, "sm100", 128), (64, "torch_ref", 128), (160, "sm100", 160)],
+)
+def test_sparse_mla_padded_heads(num_heads, backend, expected):
+    """SM80 pads to a multiple of 16; FlashMLA backends keep the 128-head minimum."""
+    from loongforge.models.common.experimental_attention_variant.dsa_fused import (
+        sparse_mla_padded_heads,
+    )
+
+    assert sparse_mla_padded_heads(num_heads, backend) == expected
+
+
+@pytest.mark.skipif(_capability() != (8, 0), reason="sm80 backend test")
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_sparse_mla_sm80_head_padding_is_exact(num_heads):
+    """Padding to 16 instead of 128 heads must not change the real heads.
+
+    Zero query heads are independent of the real ones, so out / p_out / grad_q on the
+    real heads and grad_kv must match the 128-head launch (grad_out is zero on padded
+    heads, as in DSAttentionFused, which slices the output back to the real heads).
+    """
+    q, kv, idx, s_q, topk, _, d_v = _mla_inputs(64, s_q=64, h_q=num_heads, seed=num_heads)
+    args = (idx, 64, 576**-0.5, d_v, True, None, None, None, 0, False)
+    _use_backend("sm80")
+
+    results = {}
+    for pad_to in (128, num_heads):
+        qd = q.detach().clone().requires_grad_(True)
+        kd = kv.detach().clone().requires_grad_(True)
+        qp = torch.nn.functional.pad(qd, [0, 0, 0, pad_to - num_heads]) if pad_to > num_heads else qd
+        out, p_out = DSADotProductAttentionFunction.apply(qp, kd, *args)
+        out, p_out = out[:, :, :num_heads], p_out[:, :num_heads]
+        out.float().square().sum().backward()
+        results[pad_to] = (out.detach(), p_out.detach(), qd.grad, kd.grad)
+
+    for name, a, b in zip(("out", "p_out", "grad_q", "grad_kv"), results[128], results[num_heads]):
+        if name == "p_out":
+            finite = torch.isfinite(a)
+            assert torch.equal(finite, torch.isfinite(b)), "p_out mask mismatch"
+            a, b = a[finite], b[finite]
+        assert _rel(b, a) < 1e-3, name
+
+
+def _indexer_window(s_q, chunk_offset):
+    ks = torch.zeros(s_q, dtype=torch.int32, device="cuda")
+    ke = torch.arange(s_q, dtype=torch.int32, device="cuda") + chunk_offset + 1
+    return ks, ke
+
+
+def _masked_rel(a, b):
+    a, b = a.float(), b.float()
+    finite = torch.isfinite(b)
+    assert torch.equal(torch.isfinite(a), finite), "masked positions differ"
+    return ((a[finite] - b[finite]).abs().max() / b[finite].abs().max().clamp_min(1e-6)).item()
+
+
+@pytest.mark.skipif(_capability() != (8, 0), reason="sm80 backend test")
+@pytest.mark.parametrize("s_q, chunk_offset, topk", [(256, 0, 128), (512, 1024, 256)])
+def test_indexer_sm80_64_heads_matches_reference(monkeypatch, s_q, chunk_offset, topk):
+    """A 64-head indexer on the 32-head SM80 kernel (DeepSeek-V3.2) vs the reference.
+
+    The forward sums two 32-head calls block by block over query rows; the block size is
+    shrunk so several row blocks run.  The backward splits grad_q / grad_w by head group
+    and sums grad_k.  Thresholds follow the lightning_indexer_sm80 kernel tests.
+    """
+    monkeypatch.setattr(bk, "_SM80_INDEXER_BLOCK_ELEMS", 1 << 16)
+    heads, s_kv = 2 * bk._SM80_INDEXER_HEADS, s_q + chunk_offset
+    g = torch.Generator(device="cuda").manual_seed(s_q + chunk_offset)
+    q = torch.randn(s_q, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16, generator=g)
+    k = torch.randn(s_kv, HEAD_DIM, device="cuda", dtype=torch.bfloat16, generator=g)
+    w = torch.randn(s_q, heads, device="cuda", dtype=torch.float32, generator=g)
+    ks, ke = _indexer_window(s_q, chunk_offset)
+    backend = bk.DSAKernelBackend("sm80")
+
+    logits = backend.mqa_logits(q, k, w, ks, ke)
+    ref = bk._ref_bf16_mqa_logits(q, k, w, ks, ke)
+    assert logits.shape == (s_q, s_kv)
+    assert _masked_rel(logits, ref) < 1e-2
+
+    idx = ref.topk(topk, dim=-1).indices.int()
+    idx = torch.where(torch.gather(torch.isfinite(ref), 1, idx.long()), idx, torch.full_like(idx, -1))
+    grad = torch.randn(s_q, topk, device="cuda", dtype=torch.float32, generator=g)
+    got = backend.mqa_logits_bwd(grad, q, k, w, ks, ke, idx, topk)
+    want = bk._ref_bf16_mqa_logits_bwd(grad, q, k, w, ks, ke, idx)
+    assert got[0].shape == q.shape and got[2].shape == w.shape
+    for name, a, b, tol in zip(("grad_q", "grad_k", "grad_w"), got, want, (1e-2, 1e-2, 1e-3)):
+        assert _rel(a, b) < tol, name
+
+
+@pytest.mark.skipif(_capability() != (8, 0), reason="sm80 backend test")
+def test_sparse_mla_sm80_beyond_grid_y_limit():
+    """s_q above CUDA's gridDim.y ceiling (65535) must launch and match per-row results.
+
+    The kernels used to put one CTA per query token on gridDim.y and failed with
+    `invalid configuration argument` past 65535 tokens per rank; they now stride over a
+    clamped y.  Every output row (and grad_q row) depends only on its own query, so the
+    first and last 1024 rows of the long launch must equal short launches of just those
+    rows at the same q_start_index_s.
+    """
+    s_q, h_q, topk, block, d_v = 65535 + 1025, 16, 64, 1024, 512
+    g = torch.Generator(device="cuda").manual_seed(7)
+    q = torch.randn(s_q, h_q, 576, device="cuda", dtype=torch.bfloat16, generator=g) * 0.25
+    kv = torch.randn(s_q, 1, 576, device="cuda", dtype=torch.bfloat16, generator=g) * 0.25
+    limit = torch.arange(s_q, device="cuda")
+    idx = (torch.rand(s_q, 1, topk, device="cuda", generator=g) * (limit + 1).view(s_q, 1, 1).float()).floor().int()
+    d_out = torch.randn(s_q, h_q, d_v, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
+    backend, scale = bk.DSAKernelBackend("sm80"), 576**-0.5
+
+    def run(lo, hi):
+        out, _, lse, _ = backend.sparse_mla_fwd(q[lo:hi], kv, idx[lo:hi], scale, d_v, q_start_index_s=lo)
+        grad_q, _ = backend.sparse_mla_bwd(q[lo:hi], kv, out, d_out[lo:hi], idx[lo:hi], lse,
+                                           sm_scale=scale, q_start_index_s=lo)
+        return out, lse, grad_q
+
+    full = run(0, s_q)
+    assert torch.isfinite(full[0]).all() and torch.isfinite(full[2]).all()
+    for lo in (0, s_q - block):
+        part = run(lo, lo + block)
+        for name, a, b in zip(("out", "lse", "grad_q"), full, part):
+            assert torch.equal(a[lo:lo + block], b), f"{name} rows {lo}..{lo + block}"
 
 
 def teardown_module(module):  # noqa: ARG001

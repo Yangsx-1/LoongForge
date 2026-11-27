@@ -63,13 +63,30 @@ __global__ __launch_bounds__(kNumThreads) void sparse_mla_fwd_kernel(
     float* sMax = sRed + kNumWarps * kHeadBlock;          // [kHeadBlock]
     int* sIdx = reinterpret_cast<int*>(sMax + kHeadBlock);  // [kBlockT]
 
-    const int m = blockIdx.y;
     const int h0 = blockIdx.x * kHeadBlock;
     const int tid = threadIdx.x;
     const int warp = tid / kWarpSize;
     const int lane = tid % kWarpSize;
     const int g = lane >> 2;
     const int p = lane & 3;
+
+    // Query tokens are walked with a grid-stride loop over gridDim.y rather than one CTA
+    // per token.  gridDim.y is capped at 65535 by CUDA (only x reaches 2^31-1), so the
+    // original `grid(h_q / kHeadBlock, s_q)` launch failed with
+    // `invalid configuration argument` once the per-rank query length passed 65535 --
+    // a limit that showed up as "ChunkPipe cannot exceed 65535 tokens per rank".
+    // Striding over y keeps the launch shape that the head-block-first ordering was chosen
+    // for (CTAs sharing a query token, and therefore the same gathered kv, stay adjacent
+    // and hit in L2) while removing the ceiling.  When s_q <= 65535 the launcher sets
+    // gridDim.y == s_q and the loop body runs exactly once, so behaviour is bit-identical
+    // to before.
+    //
+    // Every thread in the block sees the same blockIdx.y and gridDim.y, so all threads make
+    // the same number of trips and the __syncthreads() calls inside the body stay matched.
+    // The leading barrier keeps iteration k+1's load_rows() into sQ from overtaking a
+    // straggler still reading sQ for iteration k.
+    for (int m = blockIdx.y; m < s_q; m += gridDim.y) {
+    __syncthreads();
     const int causal_limit = q_start_index_s + m;
 
     load_rows(sQ, q + (static_cast<size_t>(m) * h_q + h0) * kDQK, kHeadBlock, kDQK, kDQK, tid,
@@ -242,6 +259,7 @@ __global__ __launch_bounds__(kNumThreads) void sparse_mla_fwd_kernel(
                 lonely ? INFINITY : (__logf(row_sum[r]) + row_max[r]);
         }
     }
+    }  // grid-stride over query tokens
 }
 
 }  // namespace sparse_mla_sm80
@@ -293,7 +311,13 @@ std::vector<at::Tensor> sparse_prefill_fwd_sm80(const at::Tensor& q, const at::T
     // query token -- and therefore share the whole gathered kv -- are launched
     // adjacently and hit in L2.  With the token on x they are h_q/kHeadBlock apart
     // in launch order and each re-reads the gather from HBM.
-    const dim3 grid(h_q / kHeadBlock, s_q);
+    //
+    // y is clamped to the CUDA gridDim.y ceiling of 65535 and the kernel strides over it,
+    // so a longer query length no longer fails the launch with
+    // `invalid configuration argument`.  Below the ceiling this is the original launch
+    // shape and the kernel's loop runs once per CTA.
+    const int kMaxGridY = 65535;
+    const dim3 grid(h_q / kHeadBlock, s_q < kMaxGridY ? s_q : kMaxGridY);
     sparse_mla_fwd_kernel<<<grid, kNumThreads, smem, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()), indices.data_ptr<int>(),

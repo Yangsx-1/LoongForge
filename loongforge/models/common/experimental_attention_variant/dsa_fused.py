@@ -69,6 +69,24 @@ from .dsa_fused_kernels import (
     DSAIndexerKernel,
     fused_apply_mla_rope,
 )
+from .dsa_kernel_backend import BACKEND_SM80, resolve_backend_name
+
+# FlashMLA (SM90/SM100) sparse attention requires at least this many query heads.
+_DSA_MIN_HEAD_DIM = 128
+# The SM80 sparse MLA kernels tile heads in blocks of this size (h_q % 16 == 0).
+_SM80_HEAD_BLOCK = 16
+
+
+def sparse_mla_padded_heads(num_heads: int, backend: str) -> int:
+    """Head count the sparse MLA kernel is launched with; extra heads are zero padding.
+
+    FlashMLA needs 128 heads.  The SM80 kernels only need a multiple of 16
+    (sparse_mla_{fwd,bwd}_sm80.cu), so padding to 128 there just computes zero heads:
+    2x the work at 64 heads, 4x at 32.
+    """
+    if backend == BACKEND_SM80:
+        return -(-num_heads // _SM80_HEAD_BLOCK) * _SM80_HEAD_BLOCK
+    return max(num_heads, _DSA_MIN_HEAD_DIM)
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -806,10 +824,9 @@ class DSAttentionFused(MegatronModule):
 
         self.attn_sink = None
 
-        #padding num_attention_heads to 128
-        _DSA_MIN_HEAD_DIM = 128  # Minimum head count required by DSA sparse attention kernel
-        self.num_attention_heads_padded = max(config.num_attention_heads, _DSA_MIN_HEAD_DIM)
         self.num_attention_heads = config.num_attention_heads
+        self.num_attention_heads_padded = sparse_mla_padded_heads(
+            config.num_attention_heads, resolve_backend_name(args))
 
     def forward(
         self,
